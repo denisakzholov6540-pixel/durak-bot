@@ -1,3 +1,4 @@
+
 import socket
 import socks
 import json
@@ -15,7 +16,7 @@ class SocketListener:
         self.alive = False
         self.api_url: str = 'http://static.rstgames.com/durak/'
         self.socket = None
-        self.handlers = {}  # type: ignore[var-annotated]
+        self.handlers = {}
         self.thread = None
 
         atexit.register(self.shutdown)
@@ -25,13 +26,46 @@ class SocketListener:
         port = self.port
 
         if not ip:
-            servers = self.get_servers()['user']
-            server = servers[self.server_id] if self.server_id else list(random.choice(list(servers.items())))[1]
+            server_data = self.get_servers()
+
+            if not server_data or 'user' not in server_data:
+                raise RuntimeError(
+                    'Не удалось получить список игровых серверов.'
+                )
+
+            servers = server_data['user']
+
+            # Диагностика списка серверов в логах Render.
+            self.logger.info(
+                f'{self.tag}: Получен список игровых серверов: {servers}'
+            )
+
+            if not servers:
+                raise RuntimeError(
+                    'Список игровых серверов пуст.'
+                )
+
+            if self.server_id:
+                server = servers.get(self.server_id)
+
+                if not server:
+                    raise RuntimeError(
+                        f'Сервер с ID {self.server_id} не найден.'
+                    )
+            else:
+                server = random.choice(list(servers.values()))
+
             ip = server['host']
             port = server['port']
 
+            self.logger.info(
+                f'{self.tag}: Выбран игровой сервер {ip}:{port}'
+            )
+
         if self.proxy:
-            proxy_login, proxy_password, proxy_ip, proxy_port = self.proxy.replace('@', ':').split(':')
+            proxy_login, proxy_password, proxy_ip, proxy_port = (
+                self.proxy.replace('@', ':').split(':')
+            )
 
             socks.set_default_proxy(
                 socks.SOCKS5,
@@ -42,17 +76,35 @@ class SocketListener:
             )
             socket.socket = socks.socksocket
 
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket = socket.socket(
+            socket.AF_INET,
+            socket.SOCK_STREAM,
+        )
+
         try:
             self.socket.settimeout(10)
             self.socket.connect((ip, port))
         except Exception as e:
             if 'error' in self.handlers:
                 self.handlers['error'](e)
+
+            self.logger.error(
+                f'{self.tag}: Ошибка подключения к {ip}:{port}: {e}'
+            )
+
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+
+            self.socket = None
             return
 
         self.alive = True
-        self.thread = threading.Thread(target=self.receive_messages)
+
+        self.thread = threading.Thread(
+            target=self.receive_messages,
+        )
         self.thread.start()
 
     def send_server(self, data: dict):
@@ -60,20 +112,41 @@ class SocketListener:
             raise ValueError('Socket not created')
 
         try:
-            msg = (data.pop('command') + json.dumps(data, separators=(',', ':')).replace('{}', '') + '\n').encode()
-            self.socket.send(msg)
+            message_data = data.copy()
+            command = message_data.pop('command')
+
+            msg = (
+                command
+                + json.dumps(
+                    message_data,
+                    separators=(',', ':'),
+                ).replace('{}', '')
+                + '\n'
+            ).encode()
+
+            self.socket.sendall(msg)
+
         except Exception as e:
             if 'error' in self.handlers:
                 self.handlers['error'](e)
 
     def get_servers(self):
         try:
-            response = requests.get(f'{self.api_url}servers.json').json()
+            response = requests.get(
+                f'{self.api_url}servers.json',
+                timeout=10,
+            )
+            response.raise_for_status()
+            return response.json()
+
         except Exception as e:
             if 'error' in self.handlers:
                 self.handlers['error'](e)
-            return
-        return response
+
+            self.logger.error(
+                f'{self.tag}: Не удалось получить список серверов: {e}'
+            )
+            return None
 
     def event(self, command: str = 'all'):
         def register_handler(handler):
@@ -93,64 +166,87 @@ class SocketListener:
         return register_handler
 
     def receive_messages(self):
-        self.logger.debug(f'{self.tag}: Start listener')
-        _ = [x() for x in self.handlers.get('init', [])]
+        self.logger.debug(
+            f'{self.tag}: Start listener'
+        )
+
+        _ = [
+            handler()
+            for handler in self.handlers.get('init', [])
+        ]
 
         while self.alive:
             buffer = bytes()
+
             while self.alive:
                 try:
                     r = self.socket.recv(4096)
+
                 except Exception as e:
-                    # Closed connection
                     if not self.alive:
                         break
 
                     if 'error' in self.handlers:
                         self.handlers['error'](e)
+
+                    self.logger.error(
+                        f'{self.tag}: Ошибка чтения сокета: {e}'
+                    )
+
                     self.alive = False
                     return
 
-                buffer = buffer + r
-                read = len(r)
-                if read != -1:
-                    if read < 2:
+                if not r:
+                    self.alive = False
+                    break
+
+                buffer += r
+
+                try:
+                    decoded = buffer.decode()
+                except UnicodeDecodeError:
+                    continue
+
+                if not decoded.endswith('\n'):
+                    continue
+
+                buffer = bytes()
+
+                for message_str in decoded.strip().split('\n'):
+                    if not message_str:
                         continue
+
+                    pos = message_str.find('{')
+
+                    if pos < 0:
+                        continue
+
+                    command = message_str[:pos]
 
                     try:
-                        d = buffer.decode()
-                    except UnicodeDecodeError:
+                        message = json.loads(
+                            message_str[pos:] + '}'
+                        )
+                    except Exception:
                         continue
 
-                    if d.endswith('\n'):
-                        buffer = bytes()
-                        for message_str in d.strip().split('\n'):
-                            message_str = message_str[0:-1]
-                            if not message_str:
-                                continue
+                    message['command'] = command
 
-                            pos = message_str.find('{')
-                            command = message_str[:pos]
-                            try:
-                                message = json.loads(message_str[pos:] + '}')
-                            except Exception:
-                                continue
+                    self.logger.debug(
+                        f'{self.tag}: {message}'
+                    )
 
-                            message['command'] = command
-                            self.logger.debug(f'{self.tag}: {message}')
+                    for handler_command in self.handlers:
+                        if handler_command in ('all', command):
+                            for handler in self.handlers[handler_command]:
+                                handler(message)
 
-                            for handler_command in self.handlers:
-                                if handler_command in ['all', command]:
-                                    for handler in self.handlers[handler_command]:
-                                        handler(message)
-                            self.receive.append(message)
-                    else:
-                        continue
-                else:
-                    self.socket.close()
-                    return
+                    self.receive.append(message)
 
-        _ = [x() for x in self.handlers.get('shutdown', [])]
+        _ = [
+            handler()
+            for handler in self.handlers.get('shutdown', [])
+        ]
 
     def listen(self, force: bool = False):
         while not self.receive:
@@ -159,13 +255,21 @@ class SocketListener:
 
         response = self.receive[0]
         del self.receive[0]
+
         return response
 
     def _get_data(self, command: str, force: bool = False):
         data = self.listen(force=force)
+
         while True:
-            if data['command'] in [command, 'err', 'empty', 'alert']:
+            if data['command'] in (
+                command,
+                'err',
+                'empty',
+                'alert',
+            ):
                 return data
+
             data = self.listen(force=force)
 
     def shutdown(self) -> None:
@@ -173,12 +277,22 @@ class SocketListener:
             self.alive = False
 
         if self.socket is not None:
-            self.socket.shutdown(socket.SHUT_RDWR)
-            self.socket.close()
+            try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+            try:
+                self.socket.close()
+            except OSError:
+                pass
+
             self.socket = None
 
         if self.thread is not None:
-            self.thread.join()
+            if self.thread is not threading.current_thread():
+                self.thread.join(timeout=2)
+
             self.thread = None
 
     def __del__(self) -> None:
